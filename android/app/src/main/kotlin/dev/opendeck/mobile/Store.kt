@@ -75,6 +75,10 @@ data class StoredHost(
     val endpoints: List<String> = emptyList(),
     val isAuthenticated: Boolean = false,
     val devices: List<StoredDevice> = emptyList(),
+    /** MAC address for Wake-on-LAN, as `00:D8:61:19:4E:A6`; null if not set. Entered by the user. */
+    val wakeMac: String? = null,
+    /** Send the magic packet as soon as a connect finds the computer offline. Needs [wakeMac]. */
+    val autoWake: Boolean = false,
 )
 
 @Serializable

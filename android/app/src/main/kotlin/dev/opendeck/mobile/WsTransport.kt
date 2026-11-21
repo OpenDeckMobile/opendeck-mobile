@@ -23,6 +23,9 @@ class WsTransport(private val client: OkHttpClient) : FrameTransport {
     @Volatile var session: Session? = null
     @Volatile private var ws: WebSocket? = null
     private val opened = CompletableDeferred<Boolean>()
+    /** Why the socket failed to open; null if it timed out before OkHttp reported anything. */
+    @Volatile var failure: Throwable? = null
+        private set
 
     private val listener = object : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: Response) {
@@ -47,6 +50,7 @@ class WsTransport(private val client: OkHttpClient) : FrameTransport {
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+            if (!opened.isCompleted) failure = t
             opened.complete(false)
             session?.onTransportClosed(1006, t.message ?: t.javaClass.simpleName)
         }
