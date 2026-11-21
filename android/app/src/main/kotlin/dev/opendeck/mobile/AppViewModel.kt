@@ -246,6 +246,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             val hello = s.serverHello ?: throw SessionException("no hello")
             hostID = hello.workstationID
             rememberHost(target, hello, used)
+            learnMac(hello.workstationID, used)
             if (s.state.value == SessionState.Unauthenticated) {
                 this.retry = null // pairing needs the user, stop retrying
                 save { st -> st.withHost(hello.workstationID) { it.copy(isAuthenticated = false) } }
@@ -337,8 +338,37 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         } else {
             WakeOnLan.normalizeMac(macText) ?: return "That isn't a MAC address. Use six pairs of hex digits, like 00-D8-61-19-4E-A6."
         }
-        save { st -> st.withHost(hostID) { it.copy(wakeMac = mac, autoWake = autoWake && mac != null) } }
+        save { st ->
+            st.withHost(hostID) {
+                it.copy(wakeMac = mac, wakeMacLearned = mac != null && mac == it.wakeMac && it.wakeMacLearned, autoWake = autoWake && mac != null)
+            }
+        }
         return null
+    }
+
+    /**
+     * Learns the MAC address of the computer that just answered at [used], off the main thread and without
+     * holding up the connect. A learned address replaces a typed one: it comes from the computer itself.
+     */
+    private fun learnMac(ws: String, used: Endpoint) {
+        viewModelScope.launch {
+            val mac = try {
+                wakeSender.learnMac(used.host)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "MAC lookup failed", e)
+                null
+            }
+            val host = stored.host(ws) ?: return@launch
+            if (mac == null) {
+                Log.i(TAG, "no MAC learned for ${host.name} at ${used.host}")
+                return@launch
+            }
+            if (mac == host.wakeMac && host.wakeMacLearned) return@launch
+            Log.i(TAG, "learned MAC $mac for ${host.name} at ${used.host} (was ${host.wakeMac})")
+            save { st -> st.withHost(ws) { it.copy(wakeMac = mac, wakeMacLearned = true) } }
+        }
     }
 
     private fun scheduleRetry(last: Retry, e: Exception) {

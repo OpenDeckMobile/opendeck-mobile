@@ -319,18 +319,21 @@ private fun WakeDialog(vm: AppViewModel, host: StoredHost, thenWake: Boolean, on
     TextInputDialog(
         title = "Wake-on-LAN",
         label = "MAC address",
-        help = "Lets this phone turn ${host.name} on when it is off or asleep. Enter the MAC address of its wired " +
-            "network adapter. On Windows, run getmac /v, or open Settings > Network & internet > Ethernet and look " +
-            "for Physical address (MAC). Wake-on-LAN must also be on in the BIOS and the adapter's settings. " +
-            "Leave empty to turn it off.",
+        help = "Lets this phone turn ${host.name} on when it is off or asleep. OpenDeck learns the MAC address of " +
+            "its network adapter when it connects over Wi-Fi; if it couldn't, enter it here. On Windows, run getmac /v, " +
+            "or open Settings > Network & internet > Ethernet and look for Physical address (MAC). Wake-on-LAN must also " +
+            "be on in the BIOS and the adapter's settings.",
         confirm = if (thenWake) "Save and wake" else "Save",
         onDismiss = onDismiss,
         initial = host.wakeMac ?: "",
         extra = { text ->
             val mac = WakeOnLan.normalizeMac(text)
-            if (mac != null && mac != text.trim()) {
-                Text("Saved as $mac", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            val note = when {
+                mac != null && mac == host.wakeMac && host.wakeMacLearned -> "Learned automatically"
+                mac != null && mac != text.trim() -> "Saved as $mac"
+                else -> null
             }
+            note?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
             Row(
                 Modifier.fillMaxWidth().padding(top = 8.dp).clickable(enabled = text.isNotBlank()) { auto = !auto },
                 verticalAlignment = Alignment.CenterVertically,
@@ -366,7 +369,8 @@ private fun OfflineScreen(vm: AppViewModel, screen: Screen.Offline) {
             "in the BIOS and the network adapter. Waking from shut down can also need Windows Fast startup turned off."
         host.wakeMac != null -> "No answer from ${host.name}. It may be off or asleep. Wake it with a Wake-on-LAN packet " +
             "to ${host.wakeMac}?"
-        else -> "No answer from ${host.name}. It may be off or asleep. To turn it on from here, set up Wake-on-LAN."
+        else -> "No answer from ${host.name}. It may be off or asleep. Wake it with Wake-on-LAN? This phone hasn't " +
+            "learned its MAC address yet, so you'll be asked for it."
     }
     Column(
         Modifier.fillMaxSize().padding(24.dp),
@@ -378,17 +382,12 @@ private fun OfflineScreen(vm: AppViewModel, screen: Screen.Offline) {
         Text(body, textAlign = TextAlign.Center, modifier = Modifier.widthIn(max = 480.dp))
         Spacer(Modifier.height(24.dp))
         if (!screen.refused) {
-            if (host.wakeMac != null) {
-                Button(onClick = { vm.wake() }) { Text("Wake and connect") }
-                TextButton(onClick = { setUp = true }) { Text("Wake-on-LAN settings") }
-            } else {
-                Button(onClick = { setUp = true }) { Text("Set up Wake-on-LAN") }
-            }
+            Button(onClick = { if (host.wakeMac != null) vm.wake() else setUp = true }) { Text("Wake and connect") }
         }
         OutlinedButton(onClick = { vm.tryAgain() }) { Text("Try again") }
         TextButton(onClick = { vm.disconnect() }) { Text("Back") }
     }
-    if (setUp) WakeDialog(vm, host, thenWake = host.wakeMac == null, onDismiss = { setUp = false })
+    if (setUp) WakeDialog(vm, host, thenWake = true, onDismiss = { setUp = false })
 }
 
 @Composable
