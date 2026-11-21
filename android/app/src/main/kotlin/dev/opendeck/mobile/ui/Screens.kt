@@ -57,6 +57,8 @@ import androidx.core.graphics.drawable.toBitmap
 import androidx.compose.ui.unit.dp
 import android.os.SystemClock
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import dev.opendeck.core.WakeOnLan
 import dev.opendeck.mobile.AppViewModel
 import dev.opendeck.mobile.Screen
@@ -273,7 +275,8 @@ internal fun TextInputDialog(
         onDismissRequest = onDismiss,
         title = { Text(title) },
         text = {
-            Column {
+            // Scrolls so the whole dialog stays reachable in landscape, where the keypad phone usually sits.
+            Column(Modifier.verticalScroll(rememberScrollState())) {
                 Text(help, style = MaterialTheme.typography.bodySmall)
                 Spacer(Modifier.height(12.dp))
                 OutlinedTextField(
@@ -319,10 +322,9 @@ private fun WakeDialog(vm: AppViewModel, host: StoredHost, thenWake: Boolean, on
     TextInputDialog(
         title = "Wake-on-LAN",
         label = "MAC address",
-        help = "Lets this phone turn ${host.name} on when it is off or asleep. OpenDeck learns the MAC address of " +
-            "its network adapter when it connects over Wi-Fi; if it couldn't, enter it here. On Windows, run getmac /v, " +
-            "or open Settings > Network & internet > Ethernet and look for Physical address (MAC). Wake-on-LAN must also " +
-            "be on in the BIOS and the adapter's settings.",
+        help = "Turns ${host.name} on when it is off or asleep. OpenDeck learns its MAC address when it connects " +
+            "over Wi-Fi; if it hasn't, enter it. On Windows: getmac /v, or Settings > Network & internet > Ethernet > " +
+            "Physical address (MAC). Wake-on-LAN must be on in the BIOS and the network adapter.",
         confirm = if (thenWake) "Save and wake" else "Save",
         onDismiss = onDismiss,
         initial = host.wakeMac ?: "",

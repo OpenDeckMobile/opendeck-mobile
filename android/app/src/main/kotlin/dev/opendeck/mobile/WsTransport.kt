@@ -65,7 +65,11 @@ class WsTransport(private val client: OkHttpClient) : FrameTransport {
         }
         ws = client.newWebSocket(request, listener)
         val ok = withTimeoutOrNull(timeoutMs) { opened.await() } ?: false
-        if (!ok) cancel()
+        if (!ok) {
+            // Settle first: cancelling makes OkHttp report "Socket closed", which must not replace a timeout.
+            opened.complete(false)
+            cancel()
+        }
         return ok
     }
 
