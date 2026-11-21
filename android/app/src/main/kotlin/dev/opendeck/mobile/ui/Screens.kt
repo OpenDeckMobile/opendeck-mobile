@@ -5,8 +5,10 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.provider.Settings
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
@@ -27,6 +29,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
@@ -38,6 +41,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -51,8 +55,14 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.graphics.drawable.toBitmap
 import androidx.compose.ui.unit.dp
+import android.os.SystemClock
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import dev.opendeck.core.WakeOnLan
 import dev.opendeck.mobile.AppViewModel
 import dev.opendeck.mobile.Screen
+import dev.opendeck.mobile.StoredHost
 import kotlinx.coroutines.delay
 import androidx.compose.runtime.LaunchedEffect
 
@@ -67,7 +77,18 @@ fun App(vm: AppViewModel) {
         Box(Modifier.fillMaxSize().then(if (screen == Screen.Keypad) Modifier else Modifier.safeDrawingPadding())) {
             when (screen) {
                 Screen.Hosts -> HostsScreen(vm)
-                is Screen.Busy -> BusyScreen(screen.text, onCancel = vm::disconnect)
+                is Screen.Busy -> {
+                    val wakeHost = vm.stored.host(screen.wakeHostID)
+                    var setUp by remember { mutableStateOf(false) }
+                    BusyScreen(
+                        screen.text,
+                        onCancel = vm::disconnect,
+                        action = wakeHost?.let { h -> "Wake ${h.name}" to { if (h.wakeMac != null) vm.wake() else setUp = true } },
+                    )
+                    if (setUp && wakeHost != null) WakeDialog(vm, wakeHost, thenWake = true, onDismiss = { setUp = false })
+                }
+                is Screen.Offline -> OfflineScreen(vm, screen)
+                is Screen.Waking -> WakingScreen(vm, screen)
                 is Screen.Pairing -> PairingScreen(vm, screen.waiting)
                 Screen.Devices -> DevicesScreen(vm)
                 Screen.Keypad -> KeypadScreen(vm)
@@ -107,6 +128,7 @@ private fun HostsScreen(vm: AppViewModel) {
     }
     var showAdd by remember { mutableStateOf(false) }
     var showApps by remember { mutableStateOf(false) }
+    var wakeFor by remember { mutableStateOf<String?>(null) }
     val context = LocalContext.current
     val isHome = remember { context.isDefaultHome() }
     val saved = vm.stored.hosts
@@ -138,8 +160,9 @@ private fun HostsScreen(vm: AppViewModel) {
                     append(if (h.workstationID in online) "Online" else "Saved")
                     if (h.isAuthenticated) append(" · paired")
                     append(" · ${h.devices.size} device(s)")
+                    if (h.wakeMac != null) append(if (h.autoWake) " · wakes automatically" else " · Wake-on-LAN")
                 }
-                ListRow(h.name, status) { vm.connectSaved(h) }
+                ListRow(h.name, status, onLongClick = { wakeFor = h.workstationID }) { vm.connectSaved(h) }
             }
             items(extra, key = { "found:" + it.workstationID }) { d ->
                 ListRow(d.name, "Discovered · ${d.endpoints.firstOrNull() ?: ""}") { vm.connectDiscovered(d) }
@@ -149,6 +172,7 @@ private fun HostsScreen(vm: AppViewModel) {
         if (isHome) OutlinedButton(onClick = { showApps = true }, modifier = Modifier.fillMaxWidth()) { Text("Apps") }
     }
     if (showApps) AppsDialog(onDismiss = { showApps = false })
+    vm.stored.host(wakeFor)?.let { h -> WakeDialog(vm, h, thenWake = false, onDismiss = { wakeFor = null }) }
     if (showAdd) {
         TextInputDialog(
             title = "Add host",
@@ -218,12 +242,13 @@ internal fun AppsDialog(onDismiss: () -> Unit) {
     )
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-internal fun ListRow(title: String, subtitle: String, onClick: () -> Unit) {
+internal fun ListRow(title: String, subtitle: String, onLongClick: (() -> Unit)? = null, onClick: () -> Unit) {
     Column(
         Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick)
+            .combinedClickable(onLongClick = onLongClick, onClick = onClick)
             .padding(vertical = 12.dp),
     ) {
         Text(title, style = MaterialTheme.typography.titleMedium)
@@ -232,7 +257,7 @@ internal fun ListRow(title: String, subtitle: String, onClick: () -> Unit) {
     HorizontalDivider()
 }
 
-/** onSubmit returns an error message to show, or null to accept. */
+/** onSubmit returns an error message to show, or null to accept. [extra] is shown under the field. */
 @Composable
 internal fun TextInputDialog(
     title: String,
@@ -240,15 +265,18 @@ internal fun TextInputDialog(
     help: String,
     confirm: String,
     onDismiss: () -> Unit,
+    initial: String = "",
+    extra: @Composable (text: String) -> Unit = {},
     onSubmit: (String) -> String?,
 ) {
-    var text by remember { mutableStateOf("") }
+    var text by remember { mutableStateOf(initial) }
     var error by remember { mutableStateOf<String?>(null) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(title) },
         text = {
-            Column {
+            // Scrolls so the whole dialog stays reachable in landscape, where the keypad phone usually sits.
+            Column(Modifier.verticalScroll(rememberScrollState())) {
                 Text(help, style = MaterialTheme.typography.bodySmall)
                 Spacer(Modifier.height(12.dp))
                 OutlinedTextField(
@@ -259,6 +287,7 @@ internal fun TextInputDialog(
                     isError = error != null,
                 )
                 error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+                extra(text)
             }
         },
         confirmButton = { TextButton(onClick = { error = onSubmit(text) }) { Text(confirm) } },
@@ -266,8 +295,9 @@ internal fun TextInputDialog(
     )
 }
 
+/** [action]: an optional extra button (label to click handler) above Cancel. */
 @Composable
-private fun BusyScreen(text: String, onCancel: () -> Unit) {
+private fun BusyScreen(text: String, onCancel: () -> Unit, detail: String? = null, action: Pair<String, () -> Unit>? = null) {
     Column(
         Modifier.fillMaxSize().padding(24.dp),
         verticalArrangement = Arrangement.Center,
@@ -276,9 +306,108 @@ private fun BusyScreen(text: String, onCancel: () -> Unit) {
         CircularProgressIndicator()
         Spacer(Modifier.height(16.dp))
         Text(text, textAlign = TextAlign.Center)
+        detail?.let {
+            Text(it, textAlign = TextAlign.Center, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
         Spacer(Modifier.height(16.dp))
+        action?.let { (label, onClick) -> OutlinedButton(onClick = onClick) { Text(label) } }
         TextButton(onClick = onCancel) { Text("Cancel") }
     }
+}
+
+/** MAC address and auto-wake for a saved computer. [thenWake]: start waking it once saved. */
+@Composable
+private fun WakeDialog(vm: AppViewModel, host: StoredHost, thenWake: Boolean, onDismiss: () -> Unit) {
+    var auto by remember { mutableStateOf(host.autoWake) }
+    TextInputDialog(
+        title = "Wake-on-LAN",
+        label = "MAC address",
+        help = "Turns ${host.name} on when it is off or asleep. OpenDeck learns its MAC address when it connects " +
+            "over Wi-Fi; if it hasn't, enter it. On Windows: getmac /v, or Settings > Network & internet > Ethernet > " +
+            "Physical address (MAC). Wake-on-LAN must be on in the BIOS and the network adapter.",
+        confirm = if (thenWake) "Save and wake" else "Save",
+        onDismiss = onDismiss,
+        initial = host.wakeMac ?: "",
+        extra = { text ->
+            val mac = WakeOnLan.normalizeMac(text)
+            val note = when {
+                mac != null && mac == host.wakeMac && host.wakeMacLearned -> "Learned automatically"
+                mac != null && mac != text.trim() -> "Saved as $mac"
+                else -> null
+            }
+            note?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+            Row(
+                Modifier.fillMaxWidth().padding(top = 8.dp).clickable(enabled = text.isNotBlank()) { auto = !auto },
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Checkbox(checked = auto && text.isNotBlank(), onCheckedChange = { auto = it }, enabled = text.isNotBlank())
+                Text("Wake automatically when offline")
+            }
+        },
+        onSubmit = { text ->
+            vm.setWake(host.workstationID, text, auto).also { error ->
+                if (error == null) {
+                    onDismiss()
+                    if (thenWake && text.isNotBlank()) vm.wake()
+                }
+            }
+        },
+    )
+}
+
+@Composable
+private fun OfflineScreen(vm: AppViewModel, screen: Screen.Offline) {
+    val host = vm.stored.host(screen.hostID) ?: return
+    var setUp by remember { mutableStateOf(false) }
+    val title = when {
+        screen.refused -> "Stream Deck isn't running on ${host.name}"
+        screen.afterWake -> "${host.name} is still offline"
+        else -> "${host.name} is offline"
+    }
+    val body = when {
+        screen.refused -> "${host.name} is on, but nothing accepts connections on the Stream Deck port. " +
+            "Start the Stream Deck app on the computer, then try again."
+        screen.afterWake -> "No answer after 3 minutes. Check that the MAC address is right and that Wake-on-LAN is on " +
+            "in the BIOS and the network adapter. Waking from shut down can also need Windows Fast startup turned off."
+        host.wakeMac != null -> "No answer from ${host.name}. It may be off or asleep. Wake it with a Wake-on-LAN packet " +
+            "to ${host.wakeMac}?"
+        else -> "No answer from ${host.name}. It may be off or asleep. Wake it with Wake-on-LAN? This phone hasn't " +
+            "learned its MAC address yet, so you'll be asked for it."
+    }
+    Column(
+        Modifier.fillMaxSize().padding(24.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text(title, style = MaterialTheme.typography.headlineSmall, textAlign = TextAlign.Center)
+        Spacer(Modifier.height(16.dp))
+        Text(body, textAlign = TextAlign.Center, modifier = Modifier.widthIn(max = 480.dp))
+        Spacer(Modifier.height(24.dp))
+        if (!screen.refused) {
+            Button(onClick = { if (host.wakeMac != null) vm.wake() else setUp = true }) { Text("Wake and connect") }
+        }
+        OutlinedButton(onClick = { vm.tryAgain() }) { Text("Try again") }
+        TextButton(onClick = { vm.disconnect() }) { Text("Back") }
+    }
+    if (setUp) WakeDialog(vm, host, thenWake = true, onDismiss = { setUp = false })
+}
+
+@Composable
+private fun WakingScreen(vm: AppViewModel, screen: Screen.Waking) {
+    val host = vm.stored.host(screen.hostID)
+    var now by remember { mutableLongStateOf(SystemClock.elapsedRealtime()) }
+    LaunchedEffect(screen.since) {
+        while (true) {
+            now = SystemClock.elapsedRealtime()
+            delay(1000)
+        }
+    }
+    val secs = ((now - screen.since) / 1000).coerceAtLeast(0)
+    BusyScreen(
+        "Waking ${host?.name ?: "computer"}…",
+        onCancel = vm::disconnect,
+        detail = "%d:%02d · Wake-on-LAN packet sent to %s. Connecting as soon as it answers.".format(secs / 60, secs % 60, host?.wakeMac ?: "?"),
+    )
 }
 
 @Composable

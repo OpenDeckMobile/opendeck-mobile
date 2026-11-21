@@ -27,12 +27,14 @@ import dev.opendeck.core.ErrorCode
 import dev.opendeck.core.IconCodec
 import dev.opendeck.core.Keypad
 import dev.opendeck.core.Layout
+import dev.opendeck.core.Reachability
 import dev.opendeck.core.ServerMessage
 import dev.opendeck.core.Session
 import dev.opendeck.core.SessionException
 import dev.opendeck.core.SessionListener
 import dev.opendeck.core.SessionState
 import dev.opendeck.core.VirtualDevice
+import dev.opendeck.core.WakeOnLan
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -54,7 +56,15 @@ import kotlin.math.sqrt
 
 sealed interface Screen {
     data object Hosts : Screen
-    data class Busy(val text: String) : Screen
+    /** [wakeHostID]: the reconnect loop's saved computer, which the screen offers to wake. */
+    data class Busy(val text: String, val wakeHostID: String? = null) : Screen
+    /**
+     * No address of the saved computer [hostID] answered. [refused]: it answered with a reset, so it is on but
+     * Stream Deck isn't running. [afterWake]: a wake attempt ran out of time.
+     */
+    data class Offline(val hostID: String, val refused: Boolean, val afterWake: Boolean = false) : Screen
+    /** Magic packet sent; reconnecting until the computer answers. [since] is SystemClock.elapsedRealtime(). */
+    data class Waking(val hostID: String, val since: Long) : Screen
     data class Pairing(val waiting: Boolean) : Screen
     data object Devices : Screen
     data object Keypad : Screen
@@ -83,6 +93,9 @@ private object NoDelaySockets : SocketFactory() {
 
 /** A host to connect to. workstationID is null for manual entry (learned from the hello). */
 data class HostTarget(val workstationID: String?, val name: String, val endpoints: List<Endpoint>)
+
+/** No endpoint answered; [refused] if at least one answered with a reset (computer on, port closed). */
+class OfflineException(message: String, val refused: Boolean) : Exception(message)
 
 class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val store = Store(File(app.filesDir, "opendeck.json"))
@@ -143,6 +156,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private var resumeTarget: Pair<String, String>? =
         store.state.lastHostID?.let { ws -> store.state.lastDeviceID?.let { ws to it } }
 
+    private val wakeSender = WakeSender(app)
+
     private val discovery = Discovery(
         app,
         onHosts = { discovered.clear(); discovered.addAll(it) },
@@ -198,29 +213,161 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         discovery.stop()
         this.retry = retry
         val label = target.name.ifBlank { target.endpoints.firstOrNull()?.toString() ?: "computer" }
-        screen = Screen.Busy(
-            if (retry == null) "Connecting to $label…" else "Connection lost. Reconnecting to $label…",
-        )
+        screen = if (retry == null) {
+            Screen.Busy("Connecting to $label…")
+        } else {
+            Screen.Busy("Connection lost. Reconnecting to $label…", wakeHostID = target.workstationID?.takeIf { stored.host(it) != null })
+        }
+        job = viewModelScope.launch { attempt(target, openDeviceID, retry) }
+    }
+
+    /**
+     * One connect attempt, run on [job]. While [waking], a computer that doesn't answer yet returns false and
+     * nothing else happens; every other outcome (connected, or failed and handled) returns true.
+     */
+    private suspend fun attempt(target: HostTarget, openDeviceID: String?, retry: Retry?, waking: Boolean = false): Boolean {
+        val (s, used) = try {
+            openSession(target)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            // While booting, the computer first doesn't answer, then refuses until Stream Deck has started.
+            if (waking) return false
+            val saved = stored.host(target.workstationID)
+            when {
+                retry != null -> scheduleRetry(retry, e)
+                e is OfflineException && saved != null -> showOffline(saved, target, openDeviceID, e.refused)
+                else -> fail(e)
+            }
+            return true
+        }
+        try {
+            session = s
+            val hello = s.serverHello ?: throw SessionException("no hello")
+            hostID = hello.workstationID
+            rememberHost(target, hello, used)
+            learnMac(hello.workstationID, used)
+            if (s.state.value == SessionState.Unauthenticated) {
+                this.retry = null // pairing needs the user, stop retrying
+                save { st -> st.withHost(hello.workstationID) { it.copy(isAuthenticated = false) } }
+                screen = Screen.Pairing(waiting = false)
+            } else {
+                // A retry ends only once the device is open again (openDevice/enterKeypad clear it).
+                afterAuthenticated(s, openDeviceID)
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            if (retry != null) scheduleRetry(retry, e) else fail(e)
+        }
+        return true
+    }
+
+    // ---------- offline / Wake-on-LAN ----------
+
+    /** Where to go once an offline computer answers: the device to reopen, and whether it was a reconnect. */
+    private data class WakeTarget(val target: HostTarget, val openDeviceID: String?, val resume: Boolean)
+    private var wakeTarget: WakeTarget? = null
+
+    private fun showOffline(host: StoredHost, target: HostTarget, openDeviceID: String?, refused: Boolean) {
+        Log.i(TAG, "${host.name} offline (refused=$refused)")
+        session?.close()
+        session = null
+        wakeTarget = WakeTarget(target, openDeviceID, resume = false)
+        if (!refused && host.autoWake && host.wakeMac != null) {
+            wake()
+            return
+        }
+        screen = Screen.Offline(host.workstationID, refused)
+    }
+
+    /**
+     * Sends the magic packet and reconnects until the computer answers; from the offline screen or the reconnect
+     * screen. Does nothing if the computer has no MAC address (the screens ask for one first).
+     */
+    fun wake() {
+        val ongoing = retry
+        val t = if (ongoing != null) WakeTarget(ongoing.target, ongoing.deviceID, resume = true) else wakeTarget ?: return
+        val host = stored.host(t.target.workstationID) ?: return
+        val mac = host.wakeMac?.let { WakeOnLan.parseMac(it) } ?: return
+        disconnect()
+        discovery.stop()
+        wakeTarget = t
+        // A reconnect keeps its rules once the computer answers: it waits for the device to come back.
+        val resume = if (t.resume && t.openDeviceID != null) Retry(t.target, t.openDeviceID) else null
+        retry = resume
+        val since = SystemClock.elapsedRealtime()
+        screen = Screen.Waking(host.workstationID, since)
         job = viewModelScope.launch {
-            try {
-                val (s, used) = openSession(target)
-                session = s
-                val hello = s.serverHello ?: throw SessionException("no hello")
-                hostID = hello.workstationID
-                rememberHost(target, hello, used)
-                if (s.state.value == SessionState.Unauthenticated) {
-                    this@AppViewModel.retry = null // pairing needs the user, stop retrying
-                    save { st -> st.withHost(hello.workstationID) { it.copy(isAuthenticated = false) } }
-                    screen = Screen.Pairing(waiting = false)
-                } else {
-                    // A retry ends only once the device is open again (openDevice/enterKeypad clear it).
-                    afterAuthenticated(s, openDeviceID)
+            var lastSent = -1L
+            while (SystemClock.elapsedRealtime() - since < WAKE_TIMEOUT_MS) {
+                val now = SystemClock.elapsedRealtime()
+                if (lastSent < 0 || now - lastSent >= WAKE_RESEND_MS) {
+                    when (wakeSender.send(mac)) {
+                        WakeSender.Result.SENT -> lastSent = now
+                        WakeSender.Result.NO_WIFI ->
+                            return@launch wakeFailed(host, "The phone isn't on Wi-Fi. Wake-on-LAN works only on the computer's network.")
+                        WakeSender.Result.FAILED -> return@launch wakeFailed(host, "Could not send the wake-up packet.")
+                    }
                 }
+                if (attempt(t.target, t.openDeviceID, resume, waking = true)) return@launch
+                delay(WAKE_RETRY_MS)
+            }
+            Log.i(TAG, "${host.name} still offline after waking")
+            wakeFailed(host, null)
+        }
+    }
+
+    private fun wakeFailed(host: StoredHost, message: String?) {
+        retry = null
+        if (message != null) notice = message
+        screen = Screen.Offline(host.workstationID, refused = false, afterWake = message == null)
+    }
+
+    /** The offline screen's Try again: the same connect (or reconnect) once more. */
+    fun tryAgain() {
+        val t = wakeTarget ?: return disconnect()
+        val dev = t.openDeviceID
+        connect(t.target, dev, if (t.resume && dev != null) Retry(t.target, dev) else null)
+    }
+
+    /** Saves the Wake-on-LAN settings of a saved computer; returns an error message, or null if saved. */
+    fun setWake(hostID: String, macText: String, autoWake: Boolean): String? {
+        val mac = if (macText.isBlank()) {
+            null
+        } else {
+            WakeOnLan.normalizeMac(macText) ?: return "That isn't a MAC address. Use six pairs of hex digits, like 00-D8-61-19-4E-A6."
+        }
+        save { st ->
+            st.withHost(hostID) {
+                it.copy(wakeMac = mac, wakeMacLearned = mac != null && mac == it.wakeMac && it.wakeMacLearned, autoWake = autoWake && mac != null)
+            }
+        }
+        return null
+    }
+
+    /**
+     * Learns the MAC address of the computer that just answered at [used], off the main thread and without
+     * holding up the connect. A learned address replaces a typed one: it comes from the computer itself.
+     */
+    private fun learnMac(ws: String, used: Endpoint) {
+        viewModelScope.launch {
+            val mac = try {
+                wakeSender.learnMac(used.host)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                if (retry != null) scheduleRetry(retry, e) else fail(e)
+                Log.w(TAG, "MAC lookup failed", e)
+                null
             }
+            val host = stored.host(ws) ?: return@launch
+            if (mac == null) {
+                Log.i(TAG, "no MAC learned for ${host.name} at ${used.host}")
+                return@launch
+            }
+            if (mac == host.wakeMac && host.wakeMacLearned) return@launch
+            Log.i(TAG, "learned MAC $mac for ${host.name} at ${used.host} (was ${host.wakeMac})")
+            save { st -> st.withHost(ws) { it.copy(wakeMac = mac, wakeMacLearned = true) } }
         }
     }
 
@@ -238,6 +385,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val endpoints = target.endpoints.distinct().take(MAX_CONNECT_ATTEMPTS)
         if (endpoints.isEmpty()) throw SessionException("No known address for this computer.")
         var lastError = "Could not reach the computer."
+        // How each endpoint failed to open; one that opened counts as OTHER (something answered).
+        val reach = mutableListOf<Reachability>()
         for (ep in endpoints) {
             val transport = WsTransport(http)
             val events = Events()
@@ -246,9 +395,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             transport.session = s
             try {
                 if (!transport.open(ep, CONNECT_TIMEOUT_MS)) {
+                    val r = Reachability.of(transport.failure)
+                    Log.i(TAG, "$ep: $r (${transport.failure?.message ?: "timeout"})")
+                    reach += r
                     lastError = "Could not reach $ep."
                     continue
                 }
+                reach += Reachability.OTHER
                 s.start()
                 val st = withTimeoutOrNull(CONNECT_TIMEOUT_MS) { s.state.first { it != SessionState.AwaitingHello } }
                 when (st) {
@@ -264,6 +417,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 throw e
             }
         }
+        if (Reachability.OTHER !in reach) throw OfflineException(lastError, refused = Reachability.REFUSED in reach)
         throw SessionException(lastError)
     }
 
@@ -570,6 +724,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         job?.cancel()
         job = null
         retry = null
+        wakeTarget = null
         val s = session
         session = null // set first so the close callback is ignored
         s?.close()
@@ -815,6 +970,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         const val DEFAULT_DEVICE_NAME = "OpenDeck"
         const val CONNECT_TIMEOUT_MS = 6_000L
         private const val RETRY_DELAY_MS = 3_000L
+        // Waking covers a cold boot plus Stream Deck starting; the packet is re-sent in case one was lost.
+        private const val WAKE_TIMEOUT_MS = 180_000L
+        private const val WAKE_RETRY_MS = 3_000L
+        private const val WAKE_RESEND_MS = 20_000L
         const val MAX_CONNECT_ATTEMPTS = 5
         const val MAX_STORED_ENDPOINTS = 8
         // Quiet after the last icon that ends a redraw (the page is then complete and cached for swipes).
