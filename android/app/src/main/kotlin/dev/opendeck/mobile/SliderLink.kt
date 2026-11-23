@@ -21,8 +21,9 @@ class SliderLink(
     private val onClosed: () -> Unit,
 ) {
     private val writer = Executors.newSingleThreadExecutor { Thread(it, "sliders-write") }
+    // Written on the writer thread only; the reader thread checks whether its socket is still this one.
+    @Volatile private var socket: Socket? = null
     // Writer thread only.
-    private var socket: Socket? = null
     private var lastPage: ByteArray? = null
     private var lastAttempt = Long.MIN_VALUE / 2
 
@@ -102,7 +103,8 @@ class SliderLink(
             // closed or dropped
         }
         s.close()
-        onClosed()
+        // A socket already replaced by a new connection must not clear the faders that connection delivered.
+        if (socket === s) onClosed()
     }
 
     private companion object {
