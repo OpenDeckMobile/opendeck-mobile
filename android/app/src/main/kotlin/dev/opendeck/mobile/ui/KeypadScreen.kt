@@ -126,7 +126,7 @@ fun KeypadScreen(vm: AppViewModel) {
     var width by remember { mutableIntStateOf(1) }
     var axis by remember { mutableIntStateOf(AXIS_NONE) }
     val grab = remember { SliderGrab() }
-    val faders = remember(vm) { FaderInput(grab, { vm.sliders[it] }, { vm.sliderBegin(it) }, { id, offset -> vm.sliderMove(id, offset) }) }
+    val faders = remember(vm) { FaderInput(grab, { vm.sliders[it] }, { vm.sliderBegin(it) }, { id, position -> vm.sliderMove(id, position) }) }
     val scope = rememberCoroutineScope()
     val minSwipe = with(LocalDensity.current) { MIN_SWIPE.toPx() }
     // Swipe left/right drags the next/previous page in under the finger; down reveals the bar, up hides it.
@@ -379,7 +379,7 @@ private class FaderInput(
     val grab: SliderGrab,
     val key: (Int) -> Sliders.Key?,
     val begin: (Int) -> Unit,
-    val move: (id: Int, offset: Int) -> Unit,
+    val move: (id: Int, position: Int) -> Unit,
 )
 
 private val ROTATIONS = listOf(
@@ -497,24 +497,28 @@ private fun KeyCell(
                     val d = c.position - down.position
                     return if (fader.vertical) abs(d.y) > abs(d.x) else abs(d.x) > abs(d.y)
                 }
-                // Relative to where the drag starts, so grabbing the fader never jumps the value to the finger.
+                // The knob goes where the finger is on the pair, so the whole range fits between the two keys.
                 suspend fun AwaitPointerEventScope.drag(from: PointerInputChange) {
                     input!!.grab.sliding = true
                     pressed = false
                     val id = fader!!.id
-                    val pitch = this@pointerInput.size.width.toFloat() // the cell, gap included: one key's share of the fader
+                    val pitch = this@pointerInput.size.width.toFloat() // the cell, gap included
+                    val gap = pitch * gapPercent / 100f
+                    var last = -1
+                    fun follow(c: PointerInputChange) {
+                        val position = Sliders.position(if (fader.vertical) c.position.y else c.position.x, pitch, gap, fader)
+                        if (position != last) {
+                            last = position
+                            input.move(id, position)
+                        }
+                    }
                     input.begin(id)
+                    follow(from)
                     var e = from
-                    var last = 0
                     while (e.pressed) {
                         e = awaitPointerEvent().changes.firstOrNull { it.id == down.id } ?: break
                         e.consume()
-                        val d = e.position - from.position
-                        val offset = Sliders.offset(if (fader.vertical) d.y else d.x, pitch, fader)
-                        if (offset != last) {
-                            last = offset
-                            input.move(id, offset)
-                        }
+                        follow(e)
                     }
                 }
                 var c: PointerInputChange = down
