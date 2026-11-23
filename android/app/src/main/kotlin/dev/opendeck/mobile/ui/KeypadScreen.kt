@@ -183,6 +183,7 @@ fun KeypadScreen(vm: AppViewModel) {
         awaitEachGesture {
             val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
             grab.reset() // before the key under the finger sees this touch
+            vm.touched()
             val velocity = VelocityTracker()
             velocity.addPosition(down.uptimeMillis, down.position)
             var dragging = false
