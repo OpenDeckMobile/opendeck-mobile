@@ -62,6 +62,7 @@ import androidx.compose.ui.graphics.drawOutline
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.AwaitPointerEventScope
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.changedToDown
@@ -83,6 +84,7 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import dev.opendeck.core.Keypad
+import dev.opendeck.core.Sliders
 import kotlin.math.abs
 import kotlin.math.roundToInt
 import kotlinx.coroutines.CoroutineStart
@@ -123,12 +125,19 @@ fun KeypadScreen(vm: AppViewModel) {
     var neighborSide by remember { mutableIntStateOf(1) } // 1 right of the current page, -1 left
     var width by remember { mutableIntStateOf(1) }
     var axis by remember { mutableIntStateOf(AXIS_NONE) }
+    val grab = remember { SliderGrab() }
+    val faders = remember(vm) { FaderInput(grab, { vm.sliders[it] }, { vm.sliderBegin(it) }, { id, offset -> vm.sliderMove(id, offset) }) }
     val scope = rememberCoroutineScope()
     val minSwipe = with(LocalDensity.current) { MIN_SWIPE.toPx() }
     // Swipe left/right drags the next/previous page in under the finger; down reveals the bar, up hides it.
     // total is the finger's offset since the touch went down, in screen (not moving grid) coordinates.
     val onDrag: (Offset) -> Unit = { total ->
-        if (axis == AXIS_NONE && total.getDistance() >= minSwipe) axis = if (abs(total.x) > abs(total.y)) AXIS_X else AXIS_Y
+        if (axis == AXIS_NONE && total.getDistance() >= minSwipe) {
+            val along = if (abs(total.x) > abs(total.y)) AXIS_X else AXIS_Y
+            // A drag along a fader belongs to the fader key. The key decides at the touch slop, usually before
+            // this; on a flick that crosses both thresholds in one event it hasn't yet, and decides the same way.
+            axis = if (grab.sliding ?: (along == grab.axis)) AXIS_DONE else along
+        }
         if (axis == AXIS_X) {
             if (total.x != 0f) neighborSide = if (total.x < 0) 1 else -1
             val target = vm.page.current + neighborSide
@@ -173,6 +182,7 @@ fun KeypadScreen(vm: AppViewModel) {
         val slop = viewConfiguration.touchSlop
         awaitEachGesture {
             val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+            grab.reset() // before the key under the finger sees this touch
             val velocity = VelocityTracker()
             velocity.addPosition(down.uptimeMillis, down.position)
             var dragging = false
@@ -217,6 +227,7 @@ fun KeypadScreen(vm: AppViewModel) {
             icon = { vm.icons[it] },
             title = { vm.titles[it] },
             onPress = { row, col, pressed -> vm.press(row, col, pressed) },
+            faders = faders,
         )
         if (neighbor >= 0) {
             val cached = vm.cachedPage(neighbor)
@@ -346,7 +357,29 @@ private const val COMMIT_FRACTION = 0.2f
 private const val AXIS_NONE = 0
 private const val AXIS_X = 1
 private const val AXIS_Y = 2
-private const val AXIS_DONE = 3 // vertical swipe already handled
+private const val AXIS_DONE = 3 // vertical swipe already handled, or the touch drags a fader
+
+/**
+ * One touch, as the page swipe and a fader key see it. The key sets [axis] when the touch lands on it and
+ * [sliding] once the finger leaves the slop: along the fader it drags the fader, across it swipes the page.
+ */
+private class SliderGrab {
+    var axis = AXIS_NONE
+    var sliding: Boolean? = null
+
+    fun reset() {
+        axis = AXIS_NONE
+        sliding = null
+    }
+}
+
+/** Which keys are faders ([key] by index, null for plain keys) and where their drags go. */
+private class FaderInput(
+    val grab: SliderGrab,
+    val key: (Int) -> Sliders.Key?,
+    val begin: (Int) -> Unit,
+    val move: (id: Int, offset: Int) -> Unit,
+)
 
 private val ROTATIONS = listOf(
     "No Lock" to ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED,
@@ -379,6 +412,7 @@ private fun KeyGrid(
     icon: (Int) -> ImageBitmap?,
     title: (Int) -> String?,
     onPress: ((Int, Int, Boolean) -> Unit)? = null,
+    faders: FaderInput? = null,
 ) {
     val layout = device.layout
     BoxWithConstraints(modifier.fillMaxSize().padding(8.dp), contentAlignment = Alignment.Center) {
@@ -401,6 +435,8 @@ private fun KeyGrid(
                             icon = { icon(index) },
                             title = { title(index) },
                             onPress = onPress?.let { f -> { pressed: Boolean -> f(row, col, pressed) } },
+                            index = index,
+                            faders = faders,
                         )
                     }
                 }
@@ -435,18 +471,51 @@ private fun KeyCell(
     icon: () -> ImageBitmap?,
     title: () -> String?,
     onPress: ((Boolean) -> Unit)?,
+    index: Int = -1,
+    faders: FaderInput? = null,
 ) {
     var pressed by remember { mutableStateOf(false) }
     val currentOnPress by rememberUpdatedState(onPress ?: { _: Boolean -> })
+    val currentFaders by rememberUpdatedState(faders)
+    val currentIndex by rememberUpdatedState(index)
     val touch = if (onPress == null) Modifier else Modifier.pointerInput(Unit) {
         awaitEachGesture {
             val down = awaitFirstDown()
             // The page swipe watches touches on the Initial pass, so consuming here doesn't hide them from it.
             down.consume()
             pressed = true
+            val input = currentFaders
+            val fader = input?.key?.invoke(currentIndex)
+            if (fader != null) input!!.grab.axis = if (fader.vertical) AXIS_Y else AXIS_X
             try {
                 val slop = viewConfiguration.touchSlop
                 fun moved(c: PointerInputChange) = (c.position - down.position).getDistance() > slop
+                // Past the slop along a fader key's fader: the finger drags the fader.
+                fun alongFader(c: PointerInputChange): Boolean {
+                    if (fader == null || !moved(c)) return false
+                    val d = c.position - down.position
+                    return if (fader.vertical) abs(d.y) > abs(d.x) else abs(d.x) > abs(d.y)
+                }
+                // Relative to where the drag starts, so grabbing the fader never jumps the value to the finger.
+                suspend fun AwaitPointerEventScope.drag(from: PointerInputChange) {
+                    input!!.grab.sliding = true
+                    pressed = false
+                    val id = fader!!.id
+                    val pitch = this@pointerInput.size.width.toFloat() // the cell, gap included: one key's share of the fader
+                    input.begin(id)
+                    var e = from
+                    var last = 0
+                    while (e.pressed) {
+                        e = awaitPointerEvent().changes.firstOrNull { it.id == down.id } ?: break
+                        e.consume()
+                        val d = e.position - from.position
+                        val offset = Sliders.offset(if (fader.vertical) d.y else d.x, pitch, fader)
+                        if (offset != last) {
+                            last = offset
+                            input.move(id, offset)
+                        }
+                    }
+                }
                 var c: PointerInputChange = down
                 // The press is held back until the touch is a tap (up) or a hold (timeout), so a swipe sends nothing.
                 val hold = withTimeoutOrNull(PRESS_DELAY_MS) {
@@ -459,23 +528,38 @@ private fun KeyCell(
                 when {
                     hold -> {
                         currentOnPress(true)
+                        var released = false
                         try {
                             while (true) {
                                 val e = awaitPointerEvent().changes.firstOrNull { it.id == down.id } ?: break
                                 e.consume()
+                                // A finger often rests before it moves: a hold that starts moving along the fader
+                                // becomes a drag, released first so the plugin's hold-repeat stops.
+                                if (alongFader(e)) {
+                                    currentOnPress(false)
+                                    released = true
+                                    drag(e)
+                                    break
+                                }
                                 if (!e.pressed || e.isOutOfBounds(this@pointerInput.size, extendedTouchPadding)) break
                             }
                         } finally {
                             // Release on up, on slide-off and on disposal, so keys never stick.
-                            currentOnPress(false)
+                            if (!released) currentOnPress(false)
                         }
                     }
                     moved(c) -> {
-                        // A swipe: the page handles it, the key just sends nothing.
-                        pressed = false
-                        while (c.pressed) {
-                            c = awaitPointerEvent().changes.firstOrNull { it.id == down.id } ?: break
-                            c.consume()
+                        val along = alongFader(c)
+                        if (fader != null) input!!.grab.sliding = along
+                        if (along) {
+                            drag(c)
+                        } else {
+                            // A swipe: the page handles it, the key just sends nothing.
+                            pressed = false
+                            while (c.pressed) {
+                                c = awaitPointerEvent().changes.firstOrNull { it.id == down.id } ?: break
+                                c.consume()
+                            }
                         }
                     }
                     !c.pressed -> {

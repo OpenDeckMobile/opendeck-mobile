@@ -33,6 +33,7 @@ import dev.opendeck.core.Session
 import dev.opendeck.core.SessionException
 import dev.opendeck.core.SessionListener
 import dev.opendeck.core.SessionState
+import dev.opendeck.core.Sliders
 import dev.opendeck.core.VirtualDevice
 import dev.opendeck.core.WakeOnLan
 import kotlinx.coroutines.CancellationException
@@ -127,8 +128,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val titles = mutableStateMapOf<Int, String>()
     var page by mutableStateOf(PageInfo(0, 0))
         private set
+    /** The keys of the shown page's faders, by key index; empty when the computer runs no fader helper. */
+    var sliders by mutableStateOf<Map<Int, Sliders.Key>>(emptyMap())
+        private set
 
     private var session: Session? = null
+    // The computer's address that answered, where its fader helper listens too.
+    private var sliderHost: String? = null
+    private var sliderLink: SliderLink? = null
+    private var sliderSeq = 0
     // Icons show as soon as they arrive. During a page redraw (page/device/layout change) each key waits
     // KEY_SETTLE_MS after its first icon: the server first sends a provisional render of every key (e.g.
     // plugins drawing multi-key sliders as single keys), then the final one, so only the final one shows.
@@ -243,6 +251,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
         try {
             session = s
+            sliderHost = used.host
             val hello = s.serverHello ?: throw SessionException("no hello")
             hostID = hello.workstationID
             rememberHost(target, hello, used)
@@ -657,6 +666,38 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         session?.pressKey(row, col, dev.layout, pressed)
     }
 
+    /** Asks the computer's fader helper which keys of the page just shown are faders. */
+    private fun querySliders(profileID: String, page: Int) {
+        sliders = emptyMap()
+        val host = sliderHost ?: return
+        val link = sliderLink ?: run {
+            lateinit var link: SliderLink
+            link = SliderLink(host) { seq, entries ->
+                viewModelScope.launch {
+                    // Only the answer to the newest question, on the connection still in use.
+                    if (sliderLink === link && seq == sliderSeq) sliders = Sliders.keys(entries, currentDevice?.layout ?: return@launch)
+                }
+            }
+            link.also { sliderLink = it }
+        }
+        sliderSeq = (sliderSeq + 1) and 0xFF
+        link.send(Sliders.pageFrame(sliderSeq, page, profileID), connect = true)
+    }
+
+    fun sliderBegin(id: Int) {
+        sliderLink?.send(Sliders.beginFrame(id))
+    }
+
+    fun sliderMove(id: Int, offset: Int) {
+        sliderLink?.send(Sliders.moveFrame(id, offset))
+    }
+
+    private fun closeSliders() {
+        sliderLink?.close()
+        sliderLink = null
+        sliders = emptyMap()
+    }
+
     fun nextPage() {
         beginRedraw()
         session?.nextPage()
@@ -728,6 +769,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val s = session
         session = null // set first so the close callback is ignored
         s?.close()
+        closeSliders()
+        sliderHost = null
         deviceID = null
         hostID = null
         clearIcons()
@@ -788,6 +831,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     profileID = message.profileID
                     titles.clear()
                     message.actions.forEach { titles[it.index] = it.title }
+                    if (message.totalPages > 0) querySliders(message.profileID, message.currentPage)
                 }
                 is ServerMessage.ContextUpdate -> onMain(s) {
                     message.remove.forEach { titles.remove(it) }
@@ -937,6 +981,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val s = session
         session = null
         s?.close()
+        closeSliders()
         deviceID = null
         screen = Screen.Hosts
     }
