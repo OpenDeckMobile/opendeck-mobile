@@ -672,24 +672,34 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val host = sliderHost ?: return
         val link = sliderLink ?: run {
             lateinit var link: SliderLink
-            link = SliderLink(host) { seq, entries ->
-                viewModelScope.launch {
-                    // Only the answer to the newest question, on the connection still in use.
-                    if (sliderLink === link && seq == sliderSeq) sliders = Sliders.keys(entries, currentDevice?.layout ?: return@launch)
-                }
-            }
+            link = SliderLink(
+                host,
+                onReply = { seq, entries ->
+                    viewModelScope.launch {
+                        // Only the answer to the newest question, on the connection still in use.
+                        if (sliderLink === link && seq == sliderSeq) sliders = Sliders.keys(entries, currentDevice?.layout ?: return@launch)
+                    }
+                },
+                // Helper gone: the keys are plain keys again until it answers (see touched).
+                onClosed = { viewModelScope.launch { if (sliderLink === link) sliders = emptyMap() } },
+            )
             link.also { sliderLink = it }
         }
         sliderSeq = (sliderSeq + 1) and 0xFF
-        link.send(Sliders.pageFrame(sliderSeq, page, profileID), connect = true)
+        link.page(Sliders.pageFrame(sliderSeq, page, profileID))
+    }
+
+    /** Any touch on the keypad: a helper that started late or restarted gets asked about the page again. */
+    fun touched() {
+        sliderLink?.retry()
     }
 
     fun sliderBegin(id: Int) {
-        sliderLink?.send(Sliders.beginFrame(id))
+        sliderLink?.begin(Sliders.beginFrame(id))
     }
 
     fun sliderMove(id: Int, offset: Int) {
-        sliderLink?.send(Sliders.moveFrame(id, offset))
+        sliderLink?.move(Sliders.moveFrame(id, offset))
     }
 
     private fun closeSliders() {
