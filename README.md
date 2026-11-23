@@ -74,3 +74,15 @@ You can also open `android/` in Android Studio (Ladybug or newer).
    it shows the same 6-character code as the phone.
 4. Choose a virtual device. The first one ("OpenDeck") is created automatically. The keypad
    opens full-screen and keeps the screen on.
+
+## Faders
+
+Some plugins draw one fader across two neighbouring keys, a + key and a − key. The virtual-device
+protocol only carries key presses, so those keys can only step the value. If the computer runs a
+fader helper on TCP port 28199, OpenDeck asks it which key pairs on the shown page are faders.
+On those keys you can drag the finger along the fader to move it. A tap or a hold still steps.
+Without the helper nothing changes.
+
+The wire format is in `core/.../Sliders.kt`. The helper reads the page's Stream Deck profile,
+decides which pairs are faders and applies the drag. It is not part of this repository. The port
+is unauthenticated, so only allow it from your local network.
