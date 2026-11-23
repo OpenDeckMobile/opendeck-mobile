@@ -698,8 +698,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         sliderLink?.begin(Sliders.beginFrame(id))
     }
 
-    fun sliderMove(id: Int, offset: Int) {
-        sliderLink?.move(Sliders.moveFrame(id, offset))
+    fun sliderMove(id: Int, position: Int) {
+        sliderLink?.move(Sliders.positionFrame(id, position))
     }
 
     private fun closeSliders() {
