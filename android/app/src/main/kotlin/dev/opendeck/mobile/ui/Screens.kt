@@ -89,6 +89,7 @@ fun App(vm: AppViewModel) {
                 }
                 is Screen.Offline -> OfflineScreen(vm, screen)
                 is Screen.Waking -> WakingScreen(vm, screen)
+                is Screen.Standby -> StandbyScreen(vm, screen)
                 is Screen.Pairing -> PairingScreen(vm, screen.waiting)
                 Screen.Devices -> DevicesScreen(vm)
                 Screen.Keypad -> KeypadScreen(vm)
@@ -323,7 +324,7 @@ private fun WakeDialog(vm: AppViewModel, host: StoredHost, thenWake: Boolean, on
         title = "Wake-on-LAN",
         label = "MAC address",
         help = "Turns ${host.name} on when it is off or asleep. OpenDeck learns its MAC address when it connects " +
-            "over Wi-Fi; if it hasn't, enter it. On Windows: getmac /v, or Settings > Network & internet > Ethernet > " +
+            "over Wi-Fi (from Android 11 only with the DeckSliders helper on the computer); if it hasn't, enter it. On Windows: getmac /v, or Settings > Network & internet > Ethernet > " +
             "Physical address (MAC). Wake-on-LAN must be on in the BIOS and the network adapter.",
         confirm = if (thenWake) "Save and wake" else "Save",
         onDismiss = onDismiss,
@@ -408,6 +409,29 @@ private fun WakingScreen(vm: AppViewModel, screen: Screen.Waking) {
         onCancel = vm::disconnect,
         detail = "%d:%02d · Wake-on-LAN packet sent to %s. Connecting as soon as it answers.".format(secs / 60, secs % 60, host?.wakeMac ?: "?"),
     )
+}
+
+@Composable
+private fun StandbyScreen(vm: AppViewModel, screen: Screen.Standby) {
+    val name = vm.stored.host(screen.hostID)?.name ?: "the computer"
+    Column(
+        Modifier.fillMaxSize().padding(24.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text("In use on another phone", style = MaterialTheme.typography.headlineSmall, textAlign = TextAlign.Center)
+        Spacer(Modifier.height(16.dp))
+        Text(
+            "Another phone opened this device on $name, and a device works on one phone at a time. OpenDeck takes it " +
+                "back when $name restarts or this phone's screen comes back on. To use both phones at once, open a " +
+                "different device on each (New device in the device list).",
+            textAlign = TextAlign.Center,
+            modifier = Modifier.widthIn(max = 480.dp),
+        )
+        Spacer(Modifier.height(24.dp))
+        Button(onClick = { vm.takeBack() }) { Text("Use here") }
+        TextButton(onClick = { vm.disconnect() }) { Text("Back") }
+    }
 }
 
 @Composable

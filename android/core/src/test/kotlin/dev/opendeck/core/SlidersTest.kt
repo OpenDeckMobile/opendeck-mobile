@@ -19,6 +19,17 @@ class SlidersTest {
     }
 
     @Test
+    fun macReply() {
+        assertArrayEquals(byteArrayOf('W'.code.toByte()), Sliders.macFrame())
+        val mac = byteArrayOf(0x00, 0xD8.toByte(), 0x61, 0x19, 0x4E, 0xA6.toByte())
+        assertArrayEquals(mac, Sliders.mac(byteArrayOf('W'.code.toByte()) + mac))
+        assertEquals(null, Sliders.mac(byteArrayOf('W'.code.toByte()) + ByteArray(6))) // the helper found no adapter
+        assertEquals(null, Sliders.mac(byteArrayOf('W'.code.toByte(), 1, 2, 3, 4, 5, 6))) // multicast bit set
+        assertEquals(null, Sliders.mac(byteArrayOf('S'.code.toByte()) + mac))
+        assertEquals(null, Sliders.mac(byteArrayOf('W'.code.toByte()) + mac.copyOf(5)))
+    }
+
+    @Test
     fun keysOfThePhoneDeck() {
         // Page 1 of the phone deck: + on row 0 over - on row 1; and a sideways pair with + on the right.
         val entries = byteArrayOf(0, 1, 0, 0, 0, 3, 1, 3, 0, 9, 1, 2, 2, 2, 4)

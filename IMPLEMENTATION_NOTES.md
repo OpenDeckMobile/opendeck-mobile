@@ -126,8 +126,13 @@ literally.
 - **Resume.** "Reconnect automatically on resume" works like this: if the keypad is visible
   when the activity stops, the app disconnects and remembers the host and device. On the next
   `onStart` it reconnects and reopens that device. A cold start does not auto-connect.
-- **Unexpected disconnect.** The app returns to the hosts screen and shows the reason. It does
-  not retry automatically.
+- **Unexpected disconnect.** A drop on the keypad reconnects until cancelled and reopens the
+  device. "Connection replaced" (another phone opened the device) is not retried, or two phones
+  would trade the device forever: the app shows "In use on another phone" and keeps an idle
+  connection. When that drops and the computer then refuses connections (Stream Deck quit, as
+  it does before a shutdown), the normal reconnect starts and reopens the device once Stream
+  Deck is back. No answer at all can be the phone's own Wi-Fi, so it keeps waiting. Use here,
+  or the next `onStart`, takes the device back sooner. Verified live: two connections hold two different devices at once, never one.
 - **Back button.** Back from the keypad returns to the device list and keeps the session
   open; no protocol message exists for closing a device. Back from any other connected
   screen disconnects.
@@ -153,7 +158,7 @@ literally.
   confirmed 0-based.
 - Fake server in `SessionTest` updated to mirror these behaviours; added `deviceNameClash` test.
 - `LiveProbeTest` (skipped unless `VSD2_LIVE` is set) drives a real desktop:
-  `VSD2_LIVE=ws://127.0.0.1:28198 VSD2_STEP=hello|pair|open [VSD2_ICON_DIR=dir] ./gradlew :core:cleanTest :core:test --tests '*LiveProbe*' -i`
+  `VSD2_LIVE=ws://127.0.0.1:28198 VSD2_STEP=hello|pair|open [VSD2_ICON_DIR=dir] [VSD2_IDLE_S=seconds] [VSD2_DELETE=1] ./gradlew :core:cleanTest :core:test --tests '*LiveProbe*' -i`
 - A newly paired phone always creates its own device ("OpenDeck (<phone name>)" when others
   exist) instead of offering the existing ones: the desktop gives a device to one connection
   only, so a second phone opening the first phone's device disconnects it ("Connection replaced").
