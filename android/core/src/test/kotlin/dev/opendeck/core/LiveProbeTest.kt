@@ -88,13 +88,16 @@ class LiveProbeTest {
             // How the server treats a paired connection that opens no device (the app's standby).
             System.getenv("VSD2_IDLE_S")?.let { Thread.sleep(it.toLong() * 1000); println("state after ${it}s idle: ${session.state.value}") }
             if (step == "open") {
-                val layout = Layout(3, 2)
+                // VSD2_OPEN_ID takes over an existing device, as a second phone would; give it that device's layout.
+                val (cols, rows) = (System.getenv("VSD2_LAYOUT") ?: "3x2").split("x").map { it.toInt() }
+                val layout = Layout(cols, rows)
+                val takeOver = System.getenv("VSD2_OPEN_ID")
                 val config = Keypad.keypadConfig(layout, 144)
-                val dev = devices.firstOrNull { it.name == "OpenDeck probe" }
+                val dev = if (takeOver != null) devices.first { it.id == takeOver } else devices.firstOrNull { it.name == "OpenDeck probe" }
                 // Creating also opens the device: a second open gets "Client already requested a virtual device".
                 println("opened: " + if (dev != null) session.openDevice(dev.id, config) else session.createDevice("OpenDeck probe", config, true))
-                Thread.sleep(4000) // collect context + icons
-                if (System.getenv("VSD2_DELETE") != null) {
+                Thread.sleep((System.getenv("VSD2_HOLD_S")?.toLong() ?: 4) * 1000) // collect context + icons
+                if (System.getenv("VSD2_DELETE") != null && takeOver == null) { // never someone else's device
                     println("delete sent: " + session.deleteOpenDevice())
                     // The server closes the socket once the device is gone; closing first leaves the device there.
                     withTimeout(5_000) { session.state.first { it == SessionState.Closed } }
