@@ -18,6 +18,9 @@ import kotlin.math.roundToInt
  * - `'A' id:u8 position:u16` where the finger is along the pair's two key images, in 1/[FULL] from the outer edge
  *   of the 0 % end to the outer edge of the 100 % end (the gap between the keys is skipped); the helper knows
  *   where the plugin draws the track on them
+ * - `'W'` asks for the MAC address of the computer's network adapter the connection came in on, for Wake-on-LAN
+ *   (Android 11 and later hide the neighbour table from apps); answered with `'W' mac[6]`, all zero if unknown.
+ *   It goes on a connection of its own: a helper too old to know it closes the connection it arrives on.
  *
  * Helper to client: `'S' seq:u8 n:u8` then n entries `loCol loRow hiCol hiRow id`; lo is the 0 % end, hi the 100 % end.
  */
@@ -26,6 +29,7 @@ object Sliders {
     const val FULL = 1000
     const val REPLY = 'S'.code
     const val ENTRY_SIZE = 5
+    const val MAC_REPLY_SIZE = 7
     private const val MAX_PROFILE_ID = 64
 
     /**
@@ -40,6 +44,15 @@ object Sliders {
     }
 
     fun beginFrame(id: Int) = byteArrayOf('B'.code.toByte(), id.toByte())
+
+    fun macFrame() = byteArrayOf('W'.code.toByte())
+
+    /** The address in a `'W'` [reply]; null if it isn't one or names no adapter (all zero, or not unicast). */
+    fun mac(reply: ByteArray): ByteArray? {
+        if (reply.size != MAC_REPLY_SIZE || reply[0] != 'W'.code.toByte()) return null
+        val mac = reply.copyOfRange(1, MAC_REPLY_SIZE)
+        return mac.takeIf { m -> m.any { it != 0.toByte() } && m[0].toInt() and 1 == 0 }
+    }
 
     fun positionFrame(id: Int, position: Int) =
         byteArrayOf('A'.code.toByte(), id.toByte(), position.toByte(), (position shr 8).toByte())

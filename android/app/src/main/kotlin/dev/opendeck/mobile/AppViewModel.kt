@@ -57,7 +57,7 @@ import kotlin.math.sqrt
 
 sealed interface Screen {
     data object Hosts : Screen
-    /** [wakeHostID]: the reconnect loop's saved computer, which the screen offers to wake. */
+    /** [wakeHostID]: the saved computer being connected or reconnected to, which the screen offers to wake. */
     data class Busy(val text: String, val wakeHostID: String? = null) : Screen
     /**
      * No address of the saved computer [hostID] answered. [refused]: it answered with a reset, so it is on but
@@ -66,6 +66,8 @@ sealed interface Screen {
     data class Offline(val hostID: String, val refused: Boolean, val afterWake: Boolean = false) : Screen
     /** Magic packet sent; reconnecting until the computer answers. [since] is SystemClock.elapsedRealtime(). */
     data class Waking(val hostID: String, val since: Long) : Screen
+    /** Another phone opened this phone's device on [hostID]; waiting to take it back. */
+    data class Standby(val hostID: String) : Screen
     data class Pairing(val waiting: Boolean) : Screen
     data object Devices : Screen
     data object Keypad : Screen
@@ -220,12 +222,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         disconnect()
         discovery.stop()
         this.retry = retry
+        // Set before the first attempt fails, so the Wake button works on "Connecting…" too.
+        wakeTarget = WakeTarget(target, openDeviceID, resume = retry != null)
         val label = target.name.ifBlank { target.endpoints.firstOrNull()?.toString() ?: "computer" }
-        screen = if (retry == null) {
-            Screen.Busy("Connecting to $label…")
-        } else {
-            Screen.Busy("Connection lost. Reconnecting to $label…", wakeHostID = target.workstationID?.takeIf { stored.host(it) != null })
-        }
+        screen = Screen.Busy(
+            if (retry == null) "Connecting to $label…" else "Connection lost. Reconnecting to $label…",
+            wakeHostID = target.workstationID?.takeIf { stored.host(it) != null },
+        )
         job = viewModelScope.launch { attempt(target, openDeviceID, retry) }
     }
 
@@ -369,15 +372,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 Log.w(TAG, "MAC lookup failed", e)
                 null
             }
-            val host = stored.host(ws) ?: return@launch
-            if (mac == null) {
-                Log.i(TAG, "no MAC learned for ${host.name} at ${used.host}")
-                return@launch
-            }
-            if (mac == host.wakeMac && host.wakeMacLearned) return@launch
-            Log.i(TAG, "learned MAC $mac for ${host.name} at ${used.host} (was ${host.wakeMac})")
-            save { st -> st.withHost(ws) { it.copy(wakeMac = mac, wakeMacLearned = true) } }
+            if (mac == null) Log.i(TAG, "no MAC in the neighbour table for ${used.host}") else saveLearnedMac(ws, mac)
         }
+    }
+
+    /** [mac] came from the computer [ws] itself: the neighbour table, or its fader helper on newer Android. */
+    private fun saveLearnedMac(ws: String, mac: String) {
+        val host = stored.host(ws) ?: return
+        if (mac == host.wakeMac && host.wakeMacLearned) return
+        Log.i(TAG, "learned MAC $mac for ${host.name} (was ${host.wakeMac})")
+        save { st -> st.withHost(ws) { it.copy(wakeMac = mac, wakeMacLearned = true) } }
     }
 
     private fun scheduleRetry(last: Retry, e: Exception) {
@@ -388,6 +392,48 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             delay(RETRY_DELAY_MS)
             connect(last.target, last.deviceID, last)
         }
+    }
+
+    // ---------- device taken by another phone ----------
+
+    /** The device another phone took, and the computer it is on. */
+    private var standby: Retry? = null
+
+    /**
+     * Another phone opened this phone's device: the computer gives a device to one connection only. Waits without
+     * taking it back (two phones would trade it forever), on an idle connection. When that drops and the computer
+     * then refuses connections, Stream Deck has quit (a shutdown ends it first) and nobody holds the device: the
+     * normal reconnect reopens it once Stream Deck is back. [again]: the idle connection dropped.
+     */
+    private fun standBy(target: HostTarget, deviceID: String, again: Boolean = false) {
+        disconnect()
+        val waiting = Retry(target, deviceID)
+        standby = waiting
+        screen = Screen.Standby(target.workstationID ?: "")
+        job = viewModelScope.launch {
+            // Not at once: a computer that drops idle connections must not be asked in a tight loop.
+            if (again) delay(RETRY_DELAY_MS)
+            try {
+                session = openSession(target).first
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (e is OfflineException && e.refused) {
+                    Log.i(TAG, "Stream Deck quit while another phone had the device, reconnecting")
+                    connect(target, deviceID, waiting)
+                } else {
+                    // No answer can be this phone's own Wi-Fi, with the other phone still on the device: keep
+                    // waiting. Use here and the next resume still take it back.
+                    Log.i(TAG, "standby connection failed: ${e.message}")
+                }
+            }
+        }
+    }
+
+    /** The standby screen's Use here: takes the device back from the other phone. */
+    fun takeBack() {
+        val waiting = standby ?: return
+        connect(waiting.target, waiting.deviceID)
     }
 
     private suspend fun openSession(target: HostTarget): Pair<Session, Endpoint> {
@@ -682,6 +728,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 },
                 // Helper gone: the keys are plain keys again until it answers (see touched).
                 onClosed = { viewModelScope.launch { if (sliderLink === link) sliders = emptyMap() } },
+                onMac = { mac -> viewModelScope.launch { if (sliderLink === link) saveLearnedMac(hostID ?: return@launch, WakeOnLan.formatMac(mac)) } },
             )
             link.also { sliderLink = it }
         }
@@ -775,6 +822,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         job?.cancel()
         job = null
         retry = null
+        standby = null
         wakeTarget = null
         val s = session
         session = null // set first so the close callback is ignored
@@ -800,7 +848,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun onAppStop() {
         // Don't keep retrying in the background: resume the reconnect when the app comes back.
-        val r = retry
+        // A phone waiting for its device takes it back when it comes back on.
+        val r = retry ?: standby
         val ws = if (r != null) r.target.workstationID else hostID
         val dev = r?.deviceID ?: deviceID
         if ((screen == Screen.Keypad || r != null) && ws != null && dev != null) {
@@ -869,12 +918,20 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     return@onMain
                 }
                 Log.i(TAG, "closed: $code $reason")
-                // Another phone took the device ("Connection replaced"): reconnecting would steal it back.
-                // Any other close, including the desktop app quitting ("kicked from client"), is retried.
-                val replaced = reason.contains("replaced", ignoreCase = true)
-                if (!replaced && screen == Screen.Keypad && host != null && dev != null) {
-                    Log.i(TAG, "connection lost ($code $reason), reconnecting")
-                    connect(targetFor(host), dev, Retry(targetFor(host), dev))
+                val waiting = standby
+                if (waiting != null) {
+                    standBy(waiting.target, waiting.deviceID, again = true)
+                    return@onMain
+                }
+                if (screen == Screen.Keypad && host != null && dev != null) {
+                    // Another phone took the device ("Connection replaced"): reconnecting would steal it back.
+                    // Any other close, including the desktop app quitting ("kicked from client"), is retried.
+                    if (reason.contains("replaced", ignoreCase = true)) {
+                        standBy(targetFor(host), dev)
+                    } else {
+                        Log.i(TAG, "connection lost ($code $reason), reconnecting")
+                        connect(targetFor(host), dev, Retry(targetFor(host), dev))
+                    }
                     return@onMain
                 }
                 notice = "Disconnected: $reason"

@@ -3,6 +3,7 @@ package dev.opendeck.mobile
 import android.os.SystemClock
 import android.util.Log
 import dev.opendeck.core.Sliders
+import dev.opendeck.core.WakeOnLan
 import java.io.DataInputStream
 import java.io.IOException
 import java.net.InetSocketAddress
@@ -14,11 +15,13 @@ import java.util.concurrent.Executors
  * replies arrive on a thread that blocks on the socket. The helper is optional and may start after Stream Deck
  * or restart: a page or drag start (re)connects, a new connection first names the last page again (fader ids
  * depend only on the page, so they stay valid), and [retry] lets a touch reconnect without waiting for a page change.
+ * The first connection also asks the helper for the computer's MAC address ([onMac], on the writer thread).
  */
 class SliderLink(
     private val host: String,
     private val onReply: (seq: Int, entries: ByteArray) -> Unit,
     private val onClosed: () -> Unit,
+    private val onMac: (ByteArray) -> Unit,
 ) {
     private val writer = Executors.newSingleThreadExecutor { Thread(it, "sliders-write") }
     // Written on the writer thread only; the reader thread checks whether its socket is still this one.
@@ -26,6 +29,7 @@ class SliderLink(
     // Writer thread only.
     private var lastPage: ByteArray? = null
     private var lastAttempt = Long.MIN_VALUE / 2
+    private var macAsked = false
 
     fun page(frame: ByteArray) = submit {
         lastPage = frame
@@ -78,6 +82,7 @@ class SliderLink(
     private fun connect(): Socket? {
         lastAttempt = SystemClock.elapsedRealtime()
         return try {
+            if (!macAsked) askMac()
             val s = Socket()
             s.tcpNoDelay = true // drag frames are 4 bytes: Nagle would hold each one for the previous one's ACK
             s.connect(InetSocketAddress(host, Sliders.PORT), CONNECT_TIMEOUT_MS)
@@ -87,6 +92,28 @@ class SliderLink(
         } catch (e: IOException) {
             Log.i(TAG, "no fader helper at $host: ${e.message}")
             null
+        }
+    }
+
+    /**
+     * Asks for the computer's MAC address on a connection of its own, closed before the fader one opens: a helper
+     * too old to know the question closes the connection it arrives on. Throws if the helper isn't there at all.
+     */
+    private fun askMac() {
+        Socket().use { s ->
+            s.connect(InetSocketAddress(host, Sliders.PORT), CONNECT_TIMEOUT_MS)
+            macAsked = true // once per helper found, whether or not it knows the answer
+            try {
+                s.soTimeout = CONNECT_TIMEOUT_MS
+                s.getOutputStream().write(Sliders.macFrame())
+                val reply = ByteArray(Sliders.MAC_REPLY_SIZE)
+                DataInputStream(s.getInputStream()).readFully(reply)
+                val mac = Sliders.mac(reply)
+                Log.i(TAG, "fader helper at $host: MAC ${mac?.let { WakeOnLan.formatMac(it) }}")
+                mac?.let(onMac)
+            } catch (e: IOException) {
+                Log.i(TAG, "fader helper at $host gave no MAC address: ${e.message}")
+            }
         }
     }
 
